@@ -1,5 +1,5 @@
-import math, copy
-
+import math
+import copy
 import numpy as np
 
 import torch
@@ -10,6 +10,12 @@ from torch.autograd import Variable
 from utils import xavier_normal_small_init_, xavier_uniform_small_init_
 
 
+class Graph:
+    adj_matrix: np.ndarray
+    distances_matrix: np.ndarray
+    edges_att: np.ndarray
+
+
 ### Model definition
 
 def make_model(d_atom, N=2, d_model=128, h=8, dropout=0.1, 
@@ -18,15 +24,18 @@ def make_model(d_atom, N=2, d_model=128, h=8, dropout=0.1,
                dense_output_nonlinearity='relu', distance_matrix_kernel='softmax',
                use_edge_features=False, n_output=1,
                control_edges=False, integrated_distances=False, 
-               scale_norm=False, init_type='uniform', use_adapter=False, n_generator_layers=1):
+               scale_norm=False, init_type='uniform', n_generator_layers=1):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     attn = MultiHeadedAttention(h, d_model, dropout, lambda_attention, lambda_distance, trainable_lambda, distance_matrix_kernel, use_edge_features, control_edges, integrated_distances)
     ff = PositionwiseFeedForward(d_model, N_dense, dropout, leaky_relu_slope, dense_output_nonlinearity)
     model = GraphTransformer(
-        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout, scale_norm, use_adapter), N, scale_norm),
+        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout, scale_norm), N, scale_norm),
+        Decoder(DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout, scale_norm), N, scale_norm),
         Embeddings(d_model, d_atom, dropout),
-        Generator(d_model, aggregation_type, n_output, n_generator_layers, leaky_relu_slope, dropout, scale_norm))
+        Embeddings(d_model, d_atom, dropout),
+        PositionGenerator(d_model, d_atom),
+    )
     
     # This was important from their code. 
     # Initialize parameters with Glorot / fan_avg.
@@ -44,20 +53,29 @@ def make_model(d_atom, N=2, d_model=128, h=8, dropout=0.1,
 
 
 class GraphTransformer(nn.Module):
-    def __init__(self, encoder, src_embed, generator):
+    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
         super(GraphTransformer, self).__init__()
         self.encoder = encoder
+        self.decoder = decoder
         self.src_embed = src_embed
+        self.tgt_embed = tgt_embed
         self.generator = generator
-        
-    def forward(self, src, src_mask, adj_matrix, distances_matrix, edges_att):
-        "Take in and process masked src and target sequences."
-        return self.predict(self.encode(src, src_mask, adj_matrix, distances_matrix, edges_att), src_mask)
+
+    def forward_encoder(self, src, src_mask, graph: Graph):
+        return self.predict_property(self.encode(src, src_mask, graph), src_mask)
+
+    def forward(self, src, tgt, src_mask, tgt_mask, graph: Graph):
+        tgt_graph = copy.deepcopy(graph)
+        out = self.decode(self.encode(src, src_mask, graph), src_mask, tgt, tgt_mask, tgt_graph)
+        return self.generator(out, src_mask)
     
-    def encode(self, src, src_mask, adj_matrix, distances_matrix, edges_att):
-        return self.encoder(self.src_embed(src), src_mask, adj_matrix, distances_matrix, edges_att)
+    def encode(self, src, src_mask, graph: Graph):
+        return self.encoder(self.src_embed(src), src_mask, graph)
+
+    def decode(self, memory, src_mask, tgt, tgt_mask, graph: Graph):
+        return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask, graph)
     
-    def predict(self, out, out_mask):
+    def predict_property(self, out, out_mask):
         return self.generator(out, out_mask)
     
     
@@ -97,19 +115,64 @@ class Generator(nn.Module):
     
 class PositionGenerator(nn.Module):
     "Define standard linear + softmax generation step."
-    def __init__(self, d_model):
+    def __init__(self, d_model, d_atom):
         super(PositionGenerator, self).__init__()
         self.norm = LayerNorm(d_model)
-        self.proj = nn.Linear(d_model, 3)
+        self.proj = nn.Linear(d_model, d_atom)
 
     def forward(self, x, mask):
         mask = mask.unsqueeze(-1).float()
         out_masked = self.norm(x) * mask
         projected = self.proj(out_masked)
         return projected
-    
 
-### Encoder
+
+class LayerNorm(nn.Module):
+    "Construct a layernorm module (See citation for details)."
+
+    def __init__(self, features, eps=1e-6):
+        super(LayerNorm, self).__init__()
+        self.a_2 = nn.Parameter(torch.ones(features))
+        self.b_2 = nn.Parameter(torch.zeros(features))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+
+
+class ScaleNorm(nn.Module):
+    """ScaleNorm"""
+    "All g’s in SCALE NORM are initialized to sqrt(d)"
+
+    def __init__(self, scale, eps=1e-5):
+        super(ScaleNorm, self).__init__()
+        self.scale = nn.Parameter(torch.tensor(math.sqrt(scale)))
+        self.eps = eps
+
+    def forward(self, x):
+        norm = self.scale / torch.norm(x, dim=-1, keepdim=True).clamp(min=self.eps)
+        return x * norm
+
+
+class SublayerConnection(nn.Module):
+    """
+    A residual connection followed by a layer norm.
+    Note for code simplicity the norm is first as opposed to last.
+    """
+
+    def __init__(self, size, dropout, scale_norm):
+        super(SublayerConnection, self).__init__()
+        self.norm = ScaleNorm(size) if scale_norm else LayerNorm(size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, sublayer):
+        "Apply residual connection to any sublayer with the same size."
+        return x + self.dropout(sublayer(self.norm(x)))
+
+
+# Encoder
 
 def clones(module, N):
     "Produce N identical layers."
@@ -123,66 +186,20 @@ class Encoder(nn.Module):
         self.layers = clones(layer, N)
         self.norm = ScaleNorm(layer.size) if scale_norm else LayerNorm(layer.size)
         
-    def forward(self, x, mask, adj_matrix, distances_matrix, edges_att):
+    def forward(self, x, mask, graph: Graph):
         "Pass the input (and mask) through each layer in turn."
         for layer in self.layers:
-            x = layer(x, mask, adj_matrix, distances_matrix, edges_att)
+            x = layer(x, mask, graph.adj_matrix, graph.distances_matrix, graph.edges_att)
         return self.norm(x)
 
-    
-class LayerNorm(nn.Module):
-    "Construct a layernorm module (See citation for details)."
-    def __init__(self, features, eps=1e-6):
-        super(LayerNorm, self).__init__()
-        self.a_2 = nn.Parameter(torch.ones(features))
-        self.b_2 = nn.Parameter(torch.zeros(features))
-        self.eps = eps
 
-    def forward(self, x):
-        mean = x.mean(-1, keepdim=True)
-        std = x.std(-1, keepdim=True)
-        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
-    
-    
-class ScaleNorm(nn.Module):
-    """ScaleNorm"""
-    "All g’s in SCALE NORM are initialized to sqrt(d)"
-    def __init__(self, scale, eps=1e-5):
-        super(ScaleNorm, self).__init__()
-        self.scale = nn.Parameter(torch.tensor(math.sqrt(scale)))
-        self.eps = eps
-        
-    def forward(self, x):
-        norm = self.scale / torch.norm(x, dim=-1, keepdim=True).clamp(min=self.eps)
-        return x * norm
-
-    
-class SublayerConnection(nn.Module):
-    """
-    A residual connection followed by a layer norm.
-    Note for code simplicity the norm is first as opposed to last.
-    """
-    def __init__(self, size, dropout, scale_norm, use_adapter):
-        super(SublayerConnection, self).__init__()
-        self.norm = ScaleNorm(size) if scale_norm else LayerNorm(size)
-        self.dropout = nn.Dropout(dropout)
-        self.use_adapter = use_adapter
-        self.adapter = Adapter(size, 8) if use_adapter else None
-
-    def forward(self, x, sublayer):
-        "Apply residual connection to any sublayer with the same size."
-        if self.use_adapter:
-            return x + self.dropout(self.adapter(sublayer(self.norm(x))))
-        return x + self.dropout(sublayer(self.norm(x)))
-
-    
 class EncoderLayer(nn.Module):
     "Encoder is made up of self-attn and feed forward (defined below)"
-    def __init__(self, size, self_attn, feed_forward, dropout, scale_norm, use_adapter):
+    def __init__(self, size, self_attn, feed_forward, dropout, scale_norm):
         super(EncoderLayer, self).__init__()
         self.self_attn = self_attn
         self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout, scale_norm, use_adapter), 2)
+        self.sublayer = clones(SublayerConnection(size, dropout, scale_norm), 2)
         self.size = size
 
     def forward(self, x, mask, adj_matrix, distances_matrix, edges_att):
@@ -190,8 +207,41 @@ class EncoderLayer(nn.Module):
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, adj_matrix, distances_matrix, edges_att, mask))
         return self.sublayer[1](x, self.feed_forward)
 
+
+# Decoder
+
+class Decoder(nn.Module):
+    "Generic N layer decoder with masking."
+    def __init__(self, layer, N, scale_norm):
+        super(Decoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = ScaleNorm(layer.size) if scale_norm else LayerNorm(layer.size)
+
+    def forward(self, x, memory, src_mask, tgt_mask, graph):
+        for layer in self.layers:
+            x = layer(x, memory, src_mask, tgt_mask, graph.adj_matrix, graph.distances_matrix, graph.edges_att)
+        return self.norm(x)
+
+
+class DecoderLayer(nn.Module):
+    "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
+    def __init__(self, size, self_attn, src_attn, feed_forward, dropout, scale_norm):
+        super(DecoderLayer, self).__init__()
+        self.size = size
+        self.self_attn = self_attn
+        self.src_attn = src_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout, scale_norm), 3)
+
+    def forward(self, x, memory, src_mask, tgt_mask, adj_matrix, distances_matrix, edges_att):
+        "Follow Figure 1 (right) for connections."
+        m = memory
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, adj_matrix, distances_matrix, edges_att, tgt_mask))
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, adj_matrix, distances_matrix, edges_att, src_mask))
+        return self.sublayer[2](x, self.feed_forward)
+
     
-### Attention           
+# Attention
 
 class EdgeFeaturesLayer(nn.Module):
     def __init__(self, d_model, d_edge, h, dropout):
@@ -315,7 +365,7 @@ class MultiHeadedAttention(nn.Module):
         return self.linears[-1](x)
 
 
-### Conv 1x1 aka Positionwise feed forward
+# Conv 1x1 aka Positionwise feed forward
 
 class PositionwiseFeedForward(nn.Module):
     "Implements FFN equation."
@@ -332,7 +382,6 @@ class PositionwiseFeedForward(nn.Module):
             self.dense_output_nonlinearity = lambda x: self.tanh(x)
         elif dense_output_nonlinearity == 'none':
             self.dense_output_nonlinearity = lambda x: x
-            
 
     def forward(self, x):
         if self.N_dense == 0:
@@ -344,7 +393,7 @@ class PositionwiseFeedForward(nn.Module):
         return self.dropout[-1](self.dense_output_nonlinearity(self.linears[-1](x)))
 
     
-## Embeddings
+# Embeddings
 
 class Embeddings(nn.Module):
     def __init__(self, d_model, d_atom, dropout):
@@ -354,3 +403,5 @@ class Embeddings(nn.Module):
 
     def forward(self, x):
         return self.dropout(self.lut(x))
+
+
